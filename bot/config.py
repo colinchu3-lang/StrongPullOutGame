@@ -109,6 +109,8 @@ WARMUP_DURATION      = '5 D'
 ROLLING_WINDOW       = 3000
 
 # ─── Logging / Reports ───────────────────────────────────────
-BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
-LOG_FILE    = os.path.join(BASE_DIR, 'ibkr_bot.log')
-REPORT_FILE = os.path.join(BASE_DIR, 'live_trade_report.csv')
+BASE_DIR       = os.path.dirname(os.path.abspath(__file__))
+LOG_FILE       = os.path.join(BASE_DIR, 'ibkr_bot.log')
+REPORT_FILE    = os.path.join(BASE_DIR, 'live_trade_report.csv')
+SIGNAL_LOG     = os.path.join(BASE_DIR, 'signal_log.csv')
+DAILY_SUMMARY  = os.path.join(BASE_DIR, 'daily_summary.log')

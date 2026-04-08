@@ -1,663 +1,194 @@
 """
-trade_manager.py — V13 Fusion order lifecycle manager.
+strategy.py — V13 Fusion Strategy.
 
-Key differences from generic trade manager:
-  - Asymmetric TP/SL for long vs short
-  - Long breakeven trailing stop (trigger at +40, lock at +30)
-  - Stop guard: SL not active for N minutes after entry
-  - Blocked entry windows (10:00-10:15 long, 10:30-10:45 short)
-  - Direction-based cooldown (5 min long, 15 min short)
-  - Circuit breakers: monthly DD limit, consecutive loss pause
-  - Short can flip an open long (bypass cooldown)
+Two completely independent signal systems:
+
+LONG (EMA21 pullback with 2-bar confirmation):
+  - 60m trend is bullish (EMA8 > EMA21 on 60-min)
+  - Close > SMA200 (macro filter)
+  - EMA8 > EMA21 on 1-min (bullish stack)
+  - Low touched EMA21 zone (within 0.15%) and close recovered above EMA21
+  - RSI < 65 (not overbought)
+  - 2-bar confirmation: bar after setup must close above EMA8
+  - Signal fires on the bar AFTER confirmation (enter at open)
+
+SHORT (swing low breakdown with volatility filter):
+  - Close < EMA200 (bearish macro)
+  - EMA50 declining (current < 20 bars ago)
+  - Close < swing low (10-bar lookback)
+  - ATR > ATR average (volatility expansion)
+  - 2-bar confirmation: both bars must meet conditions
+  - Signal fires on the bar AFTER confirmation (enter at open)
+  - Blocked on Wednesday (DOW filter applied in trade_manager)
 """
-import asyncio
-import csv
-import logging
-from datetime import datetime, time as dt_time, timedelta
-from typing import Optional, Dict
-from ib_async import IB, MarketOrder, LimitOrder, StopOrder, Trade
-
+import pandas as pd
+import numpy as np
 import config
 
-log = logging.getLogger(__name__)
 
-
-class TradeManager:
-
-    def __init__(self, ib: IB, contract, portfolio):
-        self.ib = ib
-        self.contract = contract
-        self.portfolio = portfolio
-
-        self.active_trade: Optional[Dict] = None
-        self.trade_log: list = []
-
-        self.virtual_cash: float = config.INITIAL_VIRTUAL_CASH
-
-        # Bracket order IDs for live mode
-        self._parent_order_id: Optional[int] = None
-        self._tp_order_id: Optional[int] = None
-        self._sl_order_id: Optional[int] = None
-        self._entry_placed_at: Optional[datetime] = None
-
-        # Direction-based cooldown
-        self._last_exit_time: Optional[datetime] = None
-        self._last_exit_direction: Optional[str] = None  # 'LONG' or 'SHORT'
-
-        # Circuit breakers
-        self._monthly_pnl: float = 0.0
-        self._current_month: Optional[int] = None  # YYYYMM
-        self._month_halted: bool = False
-        self._consec_losses: int = 0
-        self._consec_pause_until: Optional[datetime] = None
-
-        # Long breakeven trail state
-        self._be_triggered: bool = False
-        self._original_sl_price: float = 0.0
-        self._real_sl_price: float = 0.0  # real SL to apply after guard period
-
-        # Stop guard state
-        self._stop_guard_active: bool = True  # starts True, becomes False after guard period
-
-        if not config.SIMULATE_EXECUTION:
-            self.ib.orderStatusEvent += self._on_order_status
-
-        self._init_csv()
-
-    # ── Time helpers ───────────────────────────────────────────
-
-    def _now(self) -> datetime:
-        return datetime.now(config.TZ)
-
-    def _minutes_of_day(self, dt: datetime = None) -> int:
-        if dt is None:
-            dt = self._now()
-        return dt.hour * 60 + dt.minute
-
-    def is_in_kill_zone(self) -> bool:
-        now = self._now()
-        if now.weekday() > 4:
-            return False
-        mod = self._minutes_of_day(now)
-        kz_start = config.KZ_START_HOUR * 60 + config.KZ_START_MINUTE
-        kz_end = config.KZ_END_HOUR * 60 + config.KZ_END_MINUTE
-        return kz_start <= mod <= kz_end
-
-    def is_rth_now(self) -> bool:
-        """Alias for kill zone check."""
-        return self.is_in_kill_zone()
-
-    def is_close_time(self) -> bool:
-        now = self._now()
-        if now.weekday() > 4:
-            return False
-        mod = self._minutes_of_day(now)
-        eod = config.EOD_EXIT_HOUR * 60 + config.EOD_EXIT_MINUTE
-        return mod >= eod
-
-    def is_in_blocked_window(self, signal: str) -> bool:
-        mod = self._minutes_of_day()
-        if signal == 'LONG':
-            return config.LONG_BLOCK_START_MINS <= mod < config.LONG_BLOCK_END_MINS
-        elif signal == 'SHORT':
-            return config.SHORT_BLOCK_START_MINS <= mod < config.SHORT_BLOCK_END_MINS
-        return False
-
-    # ── Cooldown (direction-based) ─────────────────────────────
-
-    def is_in_cooldown(self) -> bool:
-        if self._last_exit_time is None:
-            return False
-        cooldown = (config.LONG_COOLDOWN_SECONDS if self._last_exit_direction == 'LONG'
-                    else config.SHORT_COOLDOWN_SECONDS)
-        elapsed = (self._now() - self._last_exit_time).total_seconds()
-        return elapsed < cooldown
-
-    def cooldown_remaining(self) -> float:
-        if self._last_exit_time is None:
-            return 0.0
-        cooldown = (config.LONG_COOLDOWN_SECONDS if self._last_exit_direction == 'LONG'
-                    else config.SHORT_COOLDOWN_SECONDS)
-        elapsed = (self._now() - self._last_exit_time).total_seconds()
-        return max(0.0, cooldown - elapsed)
-
-    # ── Circuit breakers ───────────────────────────────────────
-
-    def _check_month_reset(self):
-        now = self._now()
-        month_id = now.year * 100 + now.month
-        if self._current_month != month_id:
-            self._current_month = month_id
-            self._monthly_pnl = 0.0
-            self._month_halted = False
-            log.info(f"New month {month_id} — monthly PnL reset")
-
-    def is_month_halted(self) -> bool:
-        self._check_month_reset()
-        return self._month_halted
-
-    def is_consec_paused(self) -> bool:
-        if self._consec_pause_until is None:
-            return False
-        return self._now() < self._consec_pause_until
-
-    # ── Stop guard check ──────────────────────────────────────
-
-    def is_stop_guard_expired(self) -> bool:
-        """Returns True if SL is now active (guard period has passed)."""
-        if self.active_trade is None:
-            return True
-        entry_time = self.active_trade.get('entry_time')
-        if entry_time is None:
-            return True
-        guard_mins = (config.LONG_STOP_GUARD_MINS if self.active_trade['signal'] == 'LONG'
-                      else config.SHORT_STOP_GUARD_MINS)
-        elapsed = (self._now() - entry_time).total_seconds()
-        return elapsed >= guard_mins * 60
-
-    # ── Entry ──────────────────────────────────────────────────
-
-    async def open_trade(self, signal: str, price: float, ts: datetime) -> bool:
-        if self.active_trade is not None:
-            return False
-
-        if self.is_month_halted():
-            log.info("Trade skipped — month halted (DD limit)")
-            return False
-
-        if self.is_consec_paused():
-            remaining = (self._consec_pause_until - self._now()).total_seconds() / 60
-            log.info(f"Trade skipped — consec loss pause ({remaining:.0f} min left)")
-            return False
-
-        if self.is_in_blocked_window(signal):
-            log.info(f"Trade skipped — {signal} blocked window")
-            return False
-
-        # DOW filter: shorts blocked on Wednesday
-        if signal == 'SHORT' and self._now().weekday() in config.SHORT_BLOCKED_DAYS:
-            log.info(f"Trade skipped — SHORT blocked on {self._now().strftime('%A')}")
-            return False
-
-        action = 'BUY' if signal == 'LONG' else 'SELL'
-
-        if signal == 'LONG':
-            tp = price + config.LONG_TP_POINTS
-            sl = price - config.LONG_SL_POINTS
-        else:
-            tp = price - config.SHORT_TP_POINTS
-            sl = price + config.SHORT_SL_POINTS
-
-        # Size
-        if config.SIMULATE_EXECUTION:
-            qty = self._calc_contracts(self.virtual_cash)
-        else:
-            qty = self.portfolio.max_contracts()
-
-        if qty < 1:
-            log.warning(f"Insufficient margin — skipping {signal}")
-            return False
-
-        self.active_trade = {
-            'action': action,
-            'signal': signal,
-            'qty': qty,
-            'entry': price,
-            'tp': tp,
-            'sl': sl,
-            'entry_time': ts,
-        }
-
-        self._be_triggered = False
-        self._original_sl_price = sl
-        self._stop_guard_active = True
-
-        if config.SIMULATE_EXECUTION:
-            guard_mins = (config.LONG_STOP_GUARD_MINS if signal == 'LONG'
-                          else config.SHORT_STOP_GUARD_MINS)
-            be_info = (f" | BE: +{config.LONG_BE_TRIGGER_PTS:.0f}→+{config.LONG_BE_LOCK_PTS:.0f}"
-                       if signal == 'LONG'
-                       else f" | BE: +{config.SHORT_BE_TRIGGER_PTS:.0f}→+{config.SHORT_BE_LOCK_PTS:.0f}")
-            log.info(f"[SIM] ENTRY {action} {qty}ct @ {price:.2f} | "
-                     f"TP={tp:.2f} SL={sl:.2f} | Guard={guard_mins}min{be_info}")
-        else:
-            await self._place_bracket(action, qty, price, tp, sl)
-
-        return True
-
-    async def flip_to_short(self, price: float, ts: datetime) -> bool:
-        """Close an open long and immediately enter short. Bypasses cooldown."""
-        if self.active_trade is None or self.active_trade['signal'] != 'LONG':
-            return False
-
-        # DOW check — don't flip to short on blocked days
-        if self._now().weekday() in config.SHORT_BLOCKED_DAYS:
-            log.info(f"FLIP skipped — SHORT blocked on {self._now().strftime('%A')}")
-            return False
-
-        log.info(f"FLIP: closing LONG, entering SHORT @ {price:.2f}")
-
-        # Close the long
-        if config.SIMULATE_EXECUTION:
-            t = self.active_trade
-            diff = price - t['entry']
-            self._close_trade('FLIP', price, ts)
-        else:
-            await self._flatten_live("FLIP_TO_SHORT")
-
-        # Enter short immediately
-        tp = price - config.SHORT_TP_POINTS
-        sl = price + config.SHORT_SL_POINTS
-
-        qty = self.portfolio.max_contracts() if not config.SIMULATE_EXECUTION \
-            else self._calc_contracts(self.virtual_cash)
-        if qty < 1:
-            return False
-
-        self.active_trade = {
-            'action': 'SELL',
-            'signal': 'SHORT',
-            'qty': qty,
-            'entry': price,
-            'tp': tp,
-            'sl': sl,
-            'entry_time': ts,
-        }
-        self._be_triggered = False
-        self._stop_guard_active = True
-
-        if config.SIMULATE_EXECUTION:
-            log.info(f"[SIM] FLIP SHORT {qty}ct @ {price:.2f} | TP={tp:.2f} SL={sl:.2f}")
-        else:
-            await self._place_bracket('SELL', qty, price, tp, sl)
-
-        return True
-
-    # ── Exit check (sim mode) ──────────────────────────────────
-
-    def check_exit(self, bar: dict) -> Optional[str]:
-        if self.active_trade is None:
-            return None
-        if not config.SIMULATE_EXECUTION:
-            return None
-
-        t = self.active_trade
-        result = None
-        exit_price = 0.0
-
-        # Stop guard: SL not active until guard period expires
-        entry_time = t.get('entry_time')
-        bar_time = bar.get('date', self._now())
-        guard_mins = (config.LONG_STOP_GUARD_MINS if t['signal'] == 'LONG'
-                      else config.SHORT_STOP_GUARD_MINS)
-        if entry_time and isinstance(bar_time, datetime) and isinstance(entry_time, datetime):
-            stop_live = (bar_time - entry_time).total_seconds() >= guard_mins * 60
-        else:
-            stop_live = True
-
-        if t['action'] == 'BUY':
-            # Long breakeven trail
-            if not self._be_triggered and bar['high'] >= t['entry'] + config.LONG_BE_TRIGGER_PTS:
-                self._be_triggered = True
-                new_sl = t['entry'] + config.LONG_BE_LOCK_PTS
-                if new_sl > t['sl']:
-                    t['sl'] = new_sl
-                    log.info(f"[SIM] BE trail activated: SL moved to {new_sl:.2f} "
-                             f"(entry+{config.LONG_BE_LOCK_PTS})")
-
-            if stop_live and bar['low'] <= t['sl']:
-                result, exit_price = 'LOSS' if t['sl'] < t['entry'] else 'WIN', t['sl']
-            elif bar['high'] >= t['tp']:
-                result, exit_price = 'WIN', t['tp']
-        else:
-            # Short breakeven trail
-            if not self._be_triggered and bar['low'] <= t['entry'] - config.SHORT_BE_TRIGGER_PTS:
-                self._be_triggered = True
-                new_sl = t['entry'] - config.SHORT_BE_LOCK_PTS
-                if new_sl < t['sl']:
-                    t['sl'] = new_sl
-                    log.info(f"[SIM] SHORT BE trail activated: SL moved to {new_sl:.2f} "
-                             f"(entry-{config.SHORT_BE_LOCK_PTS})")
-
-            if stop_live and bar['high'] >= t['sl']:
-                result, exit_price = 'LOSS' if t['sl'] > t['entry'] else 'WIN', t['sl']
-            elif bar['low'] <= t['tp']:
-                result, exit_price = 'WIN', t['tp']
-
-        if result:
-            self._close_trade(result, exit_price, bar.get('date', self._now()))
-
-        return result
-
-    # ── Live tick-level trailing stop check ─────────────────────
-
-    async def check_trail_live(self, live_price: float):
-        """Called from tick check loop to update breakeven trail in live mode."""
-        if self.active_trade is None:
-            return
-        if config.SIMULATE_EXECUTION:
-            return
-        if self._be_triggered:
-            return
-
-        t = self.active_trade
-
-        # Long BE trail: price reaches entry + trigger → lock in profit
-        if t['signal'] == 'LONG' and live_price >= t['entry'] + config.LONG_BE_TRIGGER_PTS:
-            self._be_triggered = True
-            new_sl = t['entry'] + config.LONG_BE_LOCK_PTS
-            log.info(f"[LIVE] LONG BE trail triggered @ {live_price:.2f} — "
-                     f"modifying SL to {new_sl:.2f}")
-            await self._modify_sl_order(new_sl)
-
-        # Short BE trail: price reaches entry - trigger → lock in profit
-        elif t['signal'] == 'SHORT' and live_price <= t['entry'] - config.SHORT_BE_TRIGGER_PTS:
-            self._be_triggered = True
-            new_sl = t['entry'] - config.SHORT_BE_LOCK_PTS
-            log.info(f"[LIVE] SHORT BE trail triggered @ {live_price:.2f} — "
-                     f"modifying SL to {new_sl:.2f}")
-            await self._modify_sl_order(new_sl)
-
-    async def _modify_sl_order(self, new_sl: float):
-        """Modify the live SL order to a new price."""
-        if self._sl_order_id is not None:
-            for trade_obj in self.ib.openTrades():
-                if trade_obj.order.orderId == self._sl_order_id:
-                    trade_obj.order.auxPrice = new_sl
-                    self.ib.placeOrder(self.contract, trade_obj.order)
-                    if self.active_trade:
-                        self.active_trade['sl'] = new_sl
-                    log.info(f"[LIVE] SL order modified to {new_sl:.2f}")
-                    break
-
-    # ── IB fill events ─────────────────────────────────────────
-
-    def _on_order_status(self, trade: Trade):
-        if self.active_trade is None:
-            return
-        oid = trade.order.orderId
-        status = trade.orderStatus.status
-        fill_price = trade.orderStatus.avgFillPrice
-
-        if oid == self._parent_order_id and status == 'Filled':
-            if fill_price > 0:
-                old = self.active_trade['entry']
-                slip = fill_price - old
-                self.active_trade['entry'] = fill_price
-
-                # Recalculate TP/SL from actual fill price to eliminate slippage drift
-                signal = self.active_trade['signal']
-                if signal == 'LONG':
-                    new_tp = fill_price + config.LONG_TP_POINTS
-                    new_sl = fill_price - config.LONG_SL_POINTS
-                else:
-                    new_tp = fill_price - config.SHORT_TP_POINTS
-                    new_sl = fill_price + config.SHORT_SL_POINTS
-
-                self.active_trade['tp'] = new_tp
-                self.active_trade['sl'] = new_sl
-                self._real_sl_price = new_sl  # update for guard tighten
-
-                # Modify TP order to match fill
-                if self._tp_order_id is not None:
-                    for t in self.ib.openTrades():
-                        if t.order.orderId == self._tp_order_id:
-                            t.order.lmtPrice = new_tp
-                            self.ib.placeOrder(self.contract, t.order)
-                            break
-
-                log.info(f"[LIVE] ENTRY FILLED @ {fill_price:.2f} (slip {slip:+.2f}) | "
-                         f"TP adjusted to {new_tp:.2f} | SL target {new_sl:.2f}")
-            return
-
-        if oid == self._tp_order_id and status == 'Filled':
-            result = self._determine_result(fill_price)
-            self._close_trade(result, fill_price, self._now())
-            self._clear_bracket_ids()
-            return
-
-        if oid == self._sl_order_id and status == 'Filled':
-            result = self._determine_result(fill_price)
-            self._close_trade(result, fill_price, self._now())
-            self._clear_bracket_ids()
-            return
-
-    # ── Internal close logic ───────────────────────────────────
-
-    def _determine_result(self, exit_price: float) -> str:
-        if self.active_trade is None:
-            return 'UNKNOWN'
-        t = self.active_trade
-        diff = exit_price - t['entry']
-        points = diff if t['action'] == 'BUY' else -diff
-        return 'WIN' if points > 0 else 'LOSS'
-
-    def _close_trade(self, result: str, exit_price: float, ts):
-        t = self.active_trade
-        qty = t['qty']
-        diff = exit_price - t['entry']
-        points = diff if t['action'] == 'BUY' else -diff
-        pnl = points * qty * config.TICK_VALUE
-
-        self.virtual_cash += pnl
-
-        record = {
-            'entry_time': t['entry_time'],
-            'exit_time': ts,
-            'signal': t['signal'],
-            'qty': qty,
-            'entry': t['entry'],
-            'exit': exit_price,
-            'points': round(points, 2),
-            'pnl': round(pnl, 2),
-            'result': result,
-            'balance': round(self.virtual_cash, 2),
-        }
-        self.trade_log.append(record)
-        self._write_csv(record)
-
-        mode = 'SIM' if config.SIMULATE_EXECUTION else 'LIVE'
-        log.info(f"[{mode}] EXIT {result} | {t['signal']} {qty}ct | "
-                 f"Pts: {points:+.2f} | PnL: ${pnl:+,.2f} | Bal: ${self.virtual_cash:,.2f}")
-
-        # Update circuit breakers
-        self._check_month_reset()
-        self._monthly_pnl += pnl
-        if pnl <= 0:
-            self._consec_losses += 1
-            if self._consec_losses >= config.CONSEC_LOSS_PAUSE:
-                self._consec_pause_until = self._now() + timedelta(hours=config.CONSEC_LOSS_HOURS)
-                self._consec_losses = 0
-                log.warning(f"CIRCUIT BREAKER: {config.CONSEC_LOSS_PAUSE} consec losses — "
-                            f"paused until {self._consec_pause_until.strftime('%H:%M')}")
-        else:
-            self._consec_losses = 0
-
-        if self._monthly_pnl <= -config.MONTHLY_DD_LIMIT:
-            self._month_halted = True
-            log.warning(f"CIRCUIT BREAKER: monthly DD ${self._monthly_pnl:,.2f} — halted for month")
-
-        # Direction-based cooldown
-        self._last_exit_time = self._now()
-        self._last_exit_direction = t['signal']
-
-        self.active_trade = None
-
-    # ── Bracket order placement ────────────────────────────────
-
-    async def _place_bracket(self, action, qty, entry_price, tp_price, sl_price):
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """
+    Exact Wilder's RSI — matches TOS and TradingView.
+    Seed: simple average of first `period` gains/losses.
+    Smoothing: avg = (prev * (period-1) + current) / period
+    """
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = (-delta.clip(upper=0))
+
+    avg_gain = np.full(len(series), np.nan)
+    avg_loss = np.full(len(series), np.nan)
+
+    # Seed: simple mean of first `period` changes (bars 1..period)
+    seed_slice = slice(1, period + 1)
+    avg_gain[period] = gain.iloc[seed_slice].mean()
+    avg_loss[period] = loss.iloc[seed_slice].mean()
+
+    # Wilder smoothing from bar period+1 onward
+    gain_vals = gain.values
+    loss_vals = loss.values
+    for i in range(period + 1, len(series)):
+        avg_gain[i] = (avg_gain[i - 1] * (period - 1) + gain_vals[i]) / period
+        avg_loss[i] = (avg_loss[i - 1] * (period - 1) + loss_vals[i]) / period
+
+    avg_gain = pd.Series(avg_gain, index=series.index)
+    avg_loss = pd.Series(avg_loss, index=series.index)
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+
+class FusionStrategy:
+    """
+    V13 Fusion: asymmetric long (EMA pullback) and short (swing breakdown).
+    Computes indicators on rolling 1-min bar DataFrame and checks signals.
+    """
+
+    def __init__(self):
+        pass
+
+    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Place bracket with market entry. During the stop guard period,
-        the SL is set to a 200pt catastrophic level — far enough to never
-        trigger on normal volatility, but still protects against flash crashes.
-        After the guard expires, we tighten it to the real level.
+        Calculate all indicators on the 1-min bar DataFrame.
+        Expects columns: date, open, high, low, close, volume
         """
-        signal = self.active_trade['signal'] if self.active_trade else '?'
-        guard_mins = (config.LONG_STOP_GUARD_MINS if signal == 'LONG'
-                      else config.SHORT_STOP_GUARD_MINS)
+        df = df.copy()
 
-        # Catastrophic SL during guard: 200 pts away (covers tail risk only)
-        CATASTROPHIC_DISTANCE = 200.0
-        if signal == 'LONG':
-            wide_sl = entry_price - CATASTROPHIC_DISTANCE
+        # Ensure datetime index for resampling
+        if 'date' in df.columns:
+            df['_ts'] = pd.to_datetime(df['date'], utc=True).dt.tz_localize(None)
+            df_idx = df.set_index('_ts')
         else:
-            wide_sl = entry_price + CATASTROPHIC_DISTANCE
+            df_idx = df
 
-        bracket = self.ib.bracketOrder(
-            action, qty,
-            limitPrice=entry_price,
-            takeProfitPrice=tp_price,
-            stopLossPrice=wide_sl,
+        # ── 60-min trend (shifted by 1 period) ───────────────
+        df60 = df_idx['close'].resample('60min').last().dropna().to_frame()
+        df60['ema8'] = df60['close'].ewm(span=8, adjust=False).mean()
+        df60['ema21'] = df60['close'].ewm(span=21, adjust=False).mean()
+        df60['trend_60m'] = np.where(df60['ema8'] > df60['ema21'], 1, -1)
+        df60['trend_60m'] = df60['trend_60m'].shift(1)  # no lookahead
+
+        trend_reindexed = df60['trend_60m'].reindex(df_idx.index, method='ffill')
+        if 'date' in df.columns:
+            df['trend_60m'] = trend_reindexed.values
+        else:
+            df['trend_60m'] = trend_reindexed
+        df['trend_60m'] = df['trend_60m'].fillna(0).astype(int)
+
+        # ── LONG indicators ───────────────────────────────────
+        df['ema8'] = df['close'].ewm(span=config.EMA8_PERIOD, adjust=False).mean()
+        df['ema21'] = df['close'].ewm(span=config.EMA21_PERIOD, adjust=False).mean()
+        df['sma200'] = df['close'].rolling(config.SMA200_PERIOD).mean()
+        df['rsi'] = _rsi(df['close'], config.RSI_PERIOD)
+
+        # Pullback to EMA21
+        ema21_upper = df['ema21'] * (1 + config.PULLBACK_PCT)
+        touched_ema21 = (df['low'] <= ema21_upper) & (df['close'] >= df['ema21'])
+
+        long_raw = (
+            (df['trend_60m'] == 1) &
+            (df['close'] > df['sma200']) &
+            (df['ema8'] > df['ema21']) &
+            touched_ema21 &
+            (df['rsi'] < config.RSI_OB)
         )
 
-        parent = bracket[0]
-        parent.orderType = 'MKT'
-        parent.lmtPrice = 0
-        parent.tif = 'DAY'
-        bracket[1].tif = 'GTC'  # TP
-        bracket[2].tif = 'GTC'  # SL
+        # 2-bar confirmation: bar after long_raw must close above EMA8
+        confirms_ema8 = df['close'] > df['ema8']
+        df['setup_long'] = (
+            long_raw.shift(1).fillna(False) &
+            confirms_ema8
+        ).astype(float).shift(1).fillna(0)  # enter on NEXT bar's open
 
-        trades = []
-        for order in bracket:
-            trade = self.ib.placeOrder(self.contract, order)
-            trades.append(trade)
+        # ── SHORT indicators ──────────────────────────────────
+        df['ema200'] = df['close'].ewm(span=200, adjust=False).mean()
+        df['ema50'] = df['close'].ewm(span=config.EMA_SLOPE_PERIOD, adjust=False).mean()
+        df['ema50_prev'] = df['ema50'].shift(config.EMA_SLOPE_LOOKBACK)
 
-        self._parent_order_id = trades[0].order.orderId
-        self._tp_order_id = trades[1].order.orderId
-        self._sl_order_id = trades[2].order.orderId
-        self._entry_placed_at = self._now()
-        self._real_sl_price = sl_price  # the real SL to apply after guard
+        tr = np.maximum(
+            df['high'] - df['low'],
+            np.maximum(
+                abs(df['high'] - df['close'].shift(1)),
+                abs(df['low'] - df['close'].shift(1))
+            )
+        )
+        df['atr'] = tr.rolling(config.ATR_PERIOD).mean()
+        df['atr_avg'] = df['atr'].rolling(config.ATR_AVG_PERIOD).mean()
+        df['atr_ok'] = (df['atr'] > df['atr_avg']).astype(float)
 
-        log.info(f"[LIVE] MKT bracket: {action} {qty}ct | "
-                 f"TP={tp_price:.2f} SL(catastrophic)={wide_sl:.2f} → "
-                 f"SL(real)={sl_price:.2f} after {guard_mins}min guard | "
-                 f"IDs: p={self._parent_order_id} tp={self._tp_order_id} sl={self._sl_order_id}")
+        df['swing_low'] = df['low'].shift(1).rolling(config.SWING_LOOKBACK).min()
 
-        # Schedule SL tightening after guard period
-        asyncio.create_task(self._tighten_sl_after_guard(guard_mins, sl_price))
+        bear = (df['close'] < df['ema200']) & (df['ema50'] < df['ema50_prev'])
+        short_raw = bear & (df['close'] < df['swing_low']) & (df['atr_ok'] > 0.5)
 
-    async def _tighten_sl_after_guard(self, guard_mins: int, real_sl: float):
-        """Wait for the guard period, then modify the SL order to the real level."""
-        await asyncio.sleep(guard_mins * 60)
+        df['setup_short'] = (
+            short_raw.astype(int)
+            .rolling(config.CONFIRM_BARS).min()
+            .fillna(0)
+            .shift(1)
+            .fillna(0)
+            .astype(float)
+        )
 
-        if self.active_trade is None:
-            return  # trade already closed
+        # Clean up temp column
+        if '_ts' in df.columns:
+            df.drop(columns=['_ts'], inplace=True)
 
-        # If BE trail already triggered, don't overwrite with the wider real SL
-        if self._be_triggered:
-            current_sl = self.active_trade.get('sl', real_sl)
-            signal = self.active_trade['signal']
-            # For longs: BE trail moves SL UP (higher = tighter), so if current > real, keep it
-            # For shorts: BE trail moves SL DOWN (lower = tighter), so if current < real, keep it
-            if signal == 'LONG' and current_sl > real_sl:
-                log.info(f"[LIVE] Guard expired but LONG BE trail active (SL={current_sl:.2f})")
-                return
-            elif signal == 'SHORT' and current_sl < real_sl:
-                log.info(f"[LIVE] Guard expired but SHORT BE trail active (SL={current_sl:.2f})")
-                return
+        return df
 
-        await self._modify_sl_order(real_sl)
-        log.info(f"[LIVE] Guard expired — SL tightened to {real_sl:.2f}")
+    def check_signal(self, df: pd.DataFrame) -> str | None:
+        """
+        Check the most recent bar for an entry signal.
+        Returns 'LONG', 'SHORT', or None.
+        DOW filtering is handled by trade_manager, not here.
+        """
+        if len(df) < 2:
+            return None
 
-    def _clear_bracket_ids(self):
-        self._parent_order_id = None
-        self._tp_order_id = None
-        self._sl_order_id = None
-        self._entry_placed_at = None
+        curr = df.iloc[-1]
 
-    # ── EOD Flatten ────────────────────────────────────────────
+        # Long signal
+        if curr.get('setup_long', 0) > 0.5:
+            return 'LONG'
 
-    async def flatten_all(self, reason: str = "EOD", last_price: float = 0.0):
-        if config.SIMULATE_EXECUTION:
-            if self.active_trade is None:
-                return
-            exit_price = last_price if last_price > 0 else self.active_trade['entry']
-            self._close_trade('FLAT', exit_price, self._now())
-        else:
-            await self._flatten_live(reason)
+        # Short signal
+        if curr.get('setup_short', 0) > 0.5:
+            return 'SHORT'
 
-    async def _flatten_live(self, reason: str):
-        log.info(f"[LIVE] FLATTEN ({reason})")
-        open_trades = self.ib.openTrades()
-        for t in open_trades:
-            if getattr(t.contract, 'conId', None) == self.contract.conId:
-                try:
-                    self.ib.cancelOrder(t.order)
-                except Exception:
-                    pass
+        return None
 
-        local_sym = self.contract.localSymbol
-        pos = self.portfolio.get_position(local_sym)
-        if pos and pos.qty != 0:
-            close_action = 'SELL' if pos.qty > 0 else 'BUY'
-            close_qty = int(abs(pos.qty))
-            order = MarketOrder(close_action, close_qty)
-            order.tif = 'IOC'
-            self.ib.placeOrder(self.contract, order)
-
-        if self.active_trade:
-            self.active_trade = None
-            self._clear_bracket_ids()
-
-    def _calc_contracts(self, cash: float) -> int:
-        if cash <= 0:
-            return 0
-        if config.COMPOUND:
-            raw = int(cash / config.CAPITAL_PER_CONTRACT) + 1
-            return min(max(1, raw), config.MAX_CONTRACTS)
-        margin = self.portfolio.margin_per_contract if self.portfolio else config.MARGIN_PER_CONTRACT_FALLBACK
-        return min(int(cash // margin), config.MAX_CONTRACTS)
-
-    # ── Broker sync ────────────────────────────────────────────
-
-    async def sync_with_broker(self):
-        if config.SIMULATE_EXECUTION or self.active_trade is None:
-            return
-        if self._entry_placed_at:
-            elapsed = (self._now() - self._entry_placed_at).total_seconds()
-            if elapsed < 60:
-                return
-        local_sym = self.contract.localSymbol
-        if not self.portfolio.has_open_position(local_sym):
-            t = self.active_trade
-            exit_price = t['entry']
-            for trade_obj in self.ib.trades():
-                oid = trade_obj.order.orderId
-                if oid in (self._tp_order_id, self._sl_order_id):
-                    if trade_obj.orderStatus.status == 'Filled':
-                        exit_price = trade_obj.orderStatus.avgFillPrice
-                        break
-            result = self._determine_result(exit_price)
-            self._close_trade(result, exit_price, self._now())
-            self._clear_bracket_ids()
-
-    # ── CSV / Stats ────────────────────────────────────────────
-
-    def _init_csv(self):
-        try:
-            with open(config.REPORT_FILE, 'x', newline='') as f:
-                w = csv.DictWriter(f, fieldnames=[
-                    'entry_time', 'exit_time', 'signal', 'qty',
-                    'entry', 'exit', 'points', 'pnl', 'result', 'balance',
-                ])
-                w.writeheader()
-        except FileExistsError:
-            pass
-
-    @staticmethod
-    def _write_csv(record: dict):
-        with open(config.REPORT_FILE, 'a', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=list(record.keys()))
-            w.writerow(record)
-
-    def stats_summary(self) -> str:
-        if not self.trade_log:
-            return "No trades yet."
-        wins = sum(1 for t in self.trade_log if t['result'] == 'WIN')
-        losses = sum(1 for t in self.trade_log if t['result'] in ('LOSS',))
-        total_pnl = sum(t['pnl'] for t in self.trade_log)
-        total = wins + losses
-        wr = wins / total * 100 if total > 0 else 0
-        return (f"Trades: {len(self.trade_log)} | W: {wins} L: {losses} | "
-                f"Win%: {wr:.1f}% | PnL: ${total_pnl:+,.2f} | "
-                f"MonthPnL: ${self._monthly_pnl:+,.2f}")
+    def get_indicator_summary(self, df: pd.DataFrame) -> dict:
+        """Return current indicator values for logging."""
+        if len(df) < 1:
+            return {}
+        curr = df.iloc[-1]
+        return {
+            'close': curr.get('close', 0),
+            'ema8': curr.get('ema8', float('nan')),
+            'ema21': curr.get('ema21', float('nan')),
+            'sma200': curr.get('sma200', float('nan')),
+            'rsi': curr.get('rsi', float('nan')),
+            'trend_60m': curr.get('trend_60m', 0),
+            'setup_long': curr.get('setup_long', 0),
+            'setup_short': curr.get('setup_short', 0),
+        }

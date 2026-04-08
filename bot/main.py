@@ -4,9 +4,10 @@ main.py — V13 Fusion live trading bot.
 Replicates the backtest logic as closely as possible:
   - Asymmetric long/short signals and exits
   - Kill zone: 9:45–11:15 AM ET only
-  - Short only Mon/Tue
+  - Longs: Mon–Fri | Shorts: Mon/Tue/Thu/Fri (no Wed)
   - Blocked windows (10:00–10:15 long, 10:30–10:45 short)
   - Long breakeven trail (+40 trigger → +30 lock)
+  - Short breakeven trail (+40 trigger → +20 lock)
   - Stop guard (25 min long, 15 min short)
   - Direction-based cooldown (5 min long, 15 min short)
   - Short-flips-long priority (bypass cooldown)
@@ -139,6 +140,7 @@ class TradingBot:
                     if not self._flattened_today:
                         log.info("EOD — flattening")
                         await self.trades.flatten_all("EOD", self.streamer.last_price)
+                        self.trades.write_daily_summary()
                         self._flattened_today = True
                 else:
                     self._flattened_today = False
@@ -181,6 +183,9 @@ class TradingBot:
         # Check exits first (sim mode)
         self.trades.check_exit(bar)
 
+        rsi = ind.get('rsi', 0)
+        trend = ind.get('trend_60m', 0)
+
         # SHORT flips LONG priority
         if (signal == 'SHORT'
                 and self.trades.active_trade is not None
@@ -190,26 +195,42 @@ class TradingBot:
                 and dow not in config.SHORT_BLOCKED_DAYS):
             live_price = self.streamer.last_price if self.streamer else curr['close']
             entry_price = live_price if live_price > 0 else curr['close']
+            self.trades.log_signal(signal, entry_price, 'FLIP', 'Flipping LONG→SHORT',
+                                   rsi=rsi, trend=trend, dow=dow)
             await self.trades.flip_to_short(entry_price, ts)
             return
 
         # Normal entry — DOW filtering handled inside open_trade()
         if self.trades.active_trade is None and signal:
             if not self.trades.is_in_kill_zone():
+                self.trades.log_signal(signal, curr['close'], 'SKIPPED_KZ',
+                                       'Outside kill zone', rsi=rsi, trend=trend, dow=dow)
                 return
 
             # Cooldown check — but SHORT can bypass if last exit was LONG
             if self.trades.is_in_cooldown():
                 if signal == 'SHORT' and self.trades._last_exit_direction == 'LONG':
                     log.info("SHORT bypassing LONG cooldown")
+                    self.trades.log_signal(signal, curr['close'], 'BYPASS_COOLDOWN',
+                                           'SHORT bypassing LONG cooldown',
+                                           rsi=rsi, trend=trend, dow=dow)
                 else:
+                    self.trades.log_signal(signal, curr['close'], 'SKIPPED_COOLDOWN',
+                                           f'Cooldown {self.trades.cooldown_remaining():.0f}s remaining',
+                                           rsi=rsi, trend=trend, dow=dow)
                     return
 
             live_price = self.streamer.last_price if self.streamer else curr['close']
             entry_price = live_price if live_price > 0 else curr['close']
 
             log.info(f"SIGNAL {signal} @ {entry_price:.2f} (DOW={dow})")
+            self.trades.log_signal(signal, entry_price, 'TAKEN', 'Entry attempted',
+                                   rsi=rsi, trend=trend, dow=dow)
             await self.trades.open_trade(signal, entry_price, ts)
+        elif self.trades.active_trade is not None and signal:
+            self.trades.log_signal(signal, curr['close'], 'SKIPPED_IN_TRADE',
+                                   f'Already in {self.trades.active_trade["signal"]}',
+                                   rsi=rsi, trend=trend, dow=dow)
 
     # ── Tick check (every 5s) ──────────────────────────────────
 

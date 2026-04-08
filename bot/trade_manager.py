@@ -163,20 +163,24 @@ class TradeManager:
 
         if self.is_month_halted():
             log.info("Trade skipped — month halted (DD limit)")
+            self.log_signal(signal, price, 'BLOCKED_MONTH_HALT', 'Monthly DD limit reached')
             return False
 
         if self.is_consec_paused():
             remaining = (self._consec_pause_until - self._now()).total_seconds() / 60
             log.info(f"Trade skipped — consec loss pause ({remaining:.0f} min left)")
+            self.log_signal(signal, price, 'BLOCKED_CONSEC', f'{remaining:.0f}min pause remaining')
             return False
 
         if self.is_in_blocked_window(signal):
             log.info(f"Trade skipped — {signal} blocked window")
+            self.log_signal(signal, price, 'BLOCKED_WINDOW', f'{signal} blocked window')
             return False
 
         # DOW filter: shorts blocked on Wednesday
         if signal == 'SHORT' and self._now().weekday() in config.SHORT_BLOCKED_DAYS:
             log.info(f"Trade skipped — SHORT blocked on {self._now().strftime('%A')}")
+            self.log_signal(signal, price, 'BLOCKED_DOW', f'SHORT blocked on {self._now().strftime("%A")}')
             return False
 
         action = 'BUY' if signal == 'LONG' else 'SELL'
@@ -215,9 +219,11 @@ class TradeManager:
         if config.SIMULATE_EXECUTION:
             guard_mins = (config.LONG_STOP_GUARD_MINS if signal == 'LONG'
                           else config.SHORT_STOP_GUARD_MINS)
+            be_info = (f" | BE: +{config.LONG_BE_TRIGGER_PTS:.0f}→+{config.LONG_BE_LOCK_PTS:.0f}"
+                       if signal == 'LONG'
+                       else f" | BE: +{config.SHORT_BE_TRIGGER_PTS:.0f}→+{config.SHORT_BE_LOCK_PTS:.0f}")
             log.info(f"[SIM] ENTRY {action} {qty}ct @ {price:.2f} | "
-                     f"TP={tp:.2f} SL={sl:.2f} | Guard={guard_mins}min"
-                     f"{' | BE trail: +40→+30' if signal == 'LONG' else ''}")
+                     f"TP={tp:.2f} SL={sl:.2f} | Guard={guard_mins}min{be_info}")
         else:
             await self._place_bracket(action, qty, price, tp, sl)
 
@@ -308,8 +314,17 @@ class TradeManager:
             elif bar['high'] >= t['tp']:
                 result, exit_price = 'WIN', t['tp']
         else:
+            # Short breakeven trail
+            if not self._be_triggered and bar['low'] <= t['entry'] - config.SHORT_BE_TRIGGER_PTS:
+                self._be_triggered = True
+                new_sl = t['entry'] - config.SHORT_BE_LOCK_PTS
+                if new_sl < t['sl']:
+                    t['sl'] = new_sl
+                    log.info(f"[SIM] SHORT BE trail activated: SL moved to {new_sl:.2f} "
+                             f"(entry-{config.SHORT_BE_LOCK_PTS})")
+
             if stop_live and bar['high'] >= t['sl']:
-                result, exit_price = 'LOSS', t['sl']
+                result, exit_price = 'LOSS' if t['sl'] > t['entry'] else 'WIN', t['sl']
             elif bar['low'] <= t['tp']:
                 result, exit_price = 'WIN', t['tp']
 
@@ -326,28 +341,38 @@ class TradeManager:
             return
         if config.SIMULATE_EXECUTION:
             return
-        if self.active_trade['signal'] != 'LONG':
-            return
         if self._be_triggered:
             return
 
         t = self.active_trade
-        if live_price >= t['entry'] + config.LONG_BE_TRIGGER_PTS:
+
+        # Long BE trail: price reaches entry + trigger → lock in profit
+        if t['signal'] == 'LONG' and live_price >= t['entry'] + config.LONG_BE_TRIGGER_PTS:
             self._be_triggered = True
             new_sl = t['entry'] + config.LONG_BE_LOCK_PTS
-
-            log.info(f"[LIVE] BE trail triggered @ {live_price:.2f} — "
+            log.info(f"[LIVE] LONG BE trail triggered @ {live_price:.2f} — "
                      f"modifying SL to {new_sl:.2f}")
+            await self._modify_sl_order(new_sl)
 
-            # Modify the SL order in IB
-            if self._sl_order_id is not None:
-                for trade_obj in self.ib.openTrades():
-                    if trade_obj.order.orderId == self._sl_order_id:
-                        trade_obj.order.auxPrice = new_sl
-                        self.ib.placeOrder(self.contract, trade_obj.order)
-                        t['sl'] = new_sl
-                        log.info(f"[LIVE] SL order modified to {new_sl:.2f}")
-                        break
+        # Short BE trail: price reaches entry - trigger → lock in profit
+        elif t['signal'] == 'SHORT' and live_price <= t['entry'] - config.SHORT_BE_TRIGGER_PTS:
+            self._be_triggered = True
+            new_sl = t['entry'] - config.SHORT_BE_LOCK_PTS
+            log.info(f"[LIVE] SHORT BE trail triggered @ {live_price:.2f} — "
+                     f"modifying SL to {new_sl:.2f}")
+            await self._modify_sl_order(new_sl)
+
+    async def _modify_sl_order(self, new_sl: float):
+        """Modify the live SL order to a new price."""
+        if self._sl_order_id is not None:
+            for trade_obj in self.ib.openTrades():
+                if trade_obj.order.orderId == self._sl_order_id:
+                    trade_obj.order.auxPrice = new_sl
+                    self.ib.placeOrder(self.contract, trade_obj.order)
+                    if self.active_trade:
+                        self.active_trade['sl'] = new_sl
+                    log.info(f"[LIVE] SL order modified to {new_sl:.2f}")
+                    break
 
     # ── IB fill events ─────────────────────────────────────────
 
@@ -385,6 +410,8 @@ class TradeManager:
                             self.ib.placeOrder(self.contract, t.order)
                             break
 
+                self.active_trade['_fill_slip'] = slip
+
                 log.info(f"[LIVE] ENTRY FILLED @ {fill_price:.2f} (slip {slip:+.2f}) | "
                          f"TP adjusted to {new_tp:.2f} | SL target {new_sl:.2f}")
             return
@@ -420,6 +447,32 @@ class TradeManager:
 
         self.virtual_cash += pnl
 
+        # Determine exit reason
+        if result == 'FLIP':
+            exit_reason = 'FLIP'
+        elif result == 'FLAT':
+            exit_reason = 'EOD'
+        elif self._be_triggered and points > 0 and abs(points) < 85:
+            exit_reason = 'BE_TRAIL'
+        elif points > 80:
+            exit_reason = 'TP'
+        elif points < -30:
+            exit_reason = 'SL'
+        else:
+            exit_reason = result
+
+        # Hold time
+        entry_time = t.get('entry_time')
+        hold_secs = 0
+        if entry_time and hasattr(ts, 'timestamp') and hasattr(entry_time, 'timestamp'):
+            try:
+                hold_secs = (ts - entry_time).total_seconds()
+            except Exception:
+                hold_secs = 0
+
+        guard_mins = (config.LONG_STOP_GUARD_MINS if t['signal'] == 'LONG'
+                      else config.SHORT_STOP_GUARD_MINS)
+
         record = {
             'entry_time': t['entry_time'],
             'exit_time': ts,
@@ -431,13 +484,23 @@ class TradeManager:
             'pnl': round(pnl, 2),
             'result': result,
             'balance': round(self.virtual_cash, 2),
+            'exit_reason': exit_reason,
+            'be_triggered': self._be_triggered,
+            'guard_mins': guard_mins,
+            'hold_seconds': round(hold_secs, 0),
+            'slippage': round(t.get('_fill_slip', 0), 2),
+            'monthly_pnl': round(self._monthly_pnl + pnl, 2),
+            'consec_losses': self._consec_losses + (1 if pnl <= 0 else 0),
         }
         self.trade_log.append(record)
         self._write_csv(record)
 
         mode = 'SIM' if config.SIMULATE_EXECUTION else 'LIVE'
-        log.info(f"[{mode}] EXIT {result} | {t['signal']} {qty}ct | "
-                 f"Pts: {points:+.2f} | PnL: ${pnl:+,.2f} | Bal: ${self.virtual_cash:,.2f}")
+        be_tag = ' [BE]' if self._be_triggered else ''
+        m, s = divmod(int(hold_secs), 60)
+        log.info(f"[{mode}] EXIT {result} ({exit_reason}){be_tag} | {t['signal']} {qty}ct | "
+                 f"Pts: {points:+.2f} | PnL: ${pnl:+,.2f} | Hold: {m}m{s}s | "
+                 f"Bal: ${self.virtual_cash:,.2f}")
 
         # Update circuit breakers
         self._check_month_reset()
@@ -522,21 +585,21 @@ class TradeManager:
         if self.active_trade is None:
             return  # trade already closed
 
-        # If BE trail already triggered and moved SL tighter, don't widen it
-        current_sl = self.active_trade.get('sl', real_sl)
-        if self.active_trade['signal'] == 'LONG' and self._be_triggered:
-            if current_sl > real_sl:
-                log.info(f"[LIVE] Guard expired but BE trail already active (SL={current_sl:.2f})")
+        # If BE trail already triggered, don't overwrite with the wider real SL
+        if self._be_triggered:
+            current_sl = self.active_trade.get('sl', real_sl)
+            signal = self.active_trade['signal']
+            # For longs: BE trail moves SL UP (higher = tighter), so if current > real, keep it
+            # For shorts: BE trail moves SL DOWN (lower = tighter), so if current < real, keep it
+            if signal == 'LONG' and current_sl > real_sl:
+                log.info(f"[LIVE] Guard expired but LONG BE trail active (SL={current_sl:.2f})")
+                return
+            elif signal == 'SHORT' and current_sl < real_sl:
+                log.info(f"[LIVE] Guard expired but SHORT BE trail active (SL={current_sl:.2f})")
                 return
 
-        if self._sl_order_id is not None:
-            for trade_obj in self.ib.openTrades():
-                if trade_obj.order.orderId == self._sl_order_id:
-                    trade_obj.order.auxPrice = real_sl
-                    self.ib.placeOrder(self.contract, trade_obj.order)
-                    self.active_trade['sl'] = real_sl
-                    log.info(f"[LIVE] Guard expired — SL tightened to {real_sl:.2f}")
-                    break
+        await self._modify_sl_order(real_sl)
+        log.info(f"[LIVE] Guard expired — SL tightened to {real_sl:.2f}")
 
     def _clear_bracket_ids(self):
         self._parent_order_id = None
@@ -613,21 +676,119 @@ class TradeManager:
     # ── CSV / Stats ────────────────────────────────────────────
 
     def _init_csv(self):
+        # Trade report
         try:
             with open(config.REPORT_FILE, 'x', newline='') as f:
-                w = csv.DictWriter(f, fieldnames=[
-                    'entry_time', 'exit_time', 'signal', 'qty',
-                    'entry', 'exit', 'points', 'pnl', 'result', 'balance',
-                ])
+                w = csv.DictWriter(f, fieldnames=self._trade_fields())
                 w.writeheader()
         except FileExistsError:
             pass
+        # Signal log (every signal, taken or not)
+        try:
+            with open(config.SIGNAL_LOG, 'x', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=self._signal_fields())
+                w.writeheader()
+        except FileExistsError:
+            pass
+
+    @staticmethod
+    def _trade_fields():
+        return [
+            'entry_time', 'exit_time', 'signal', 'qty',
+            'entry', 'exit', 'points', 'pnl', 'result', 'balance',
+            'exit_reason', 'be_triggered', 'guard_mins',
+            'hold_seconds', 'slippage', 'monthly_pnl', 'consec_losses',
+        ]
+
+    @staticmethod
+    def _signal_fields():
+        return [
+            'time', 'signal', 'price', 'action', 'reason',
+            'rsi', 'trend_60m', 'dow', 'in_kz', 'cooldown_remaining',
+        ]
 
     @staticmethod
     def _write_csv(record: dict):
         with open(config.REPORT_FILE, 'a', newline='') as f:
             w = csv.DictWriter(f, fieldnames=list(record.keys()))
             w.writerow(record)
+
+    def log_signal(self, signal: str, price: float, action: str, reason: str,
+                   rsi: float = 0, trend: int = 0, dow: int = -1):
+        """Log every signal event — taken, skipped, or blocked."""
+        record = {
+            'time': self._now().strftime('%Y-%m-%d %H:%M:%S'),
+            'signal': signal,
+            'price': round(price, 2),
+            'action': action,  # TAKEN, SKIPPED_COOLDOWN, SKIPPED_KZ, BLOCKED_DOW, etc
+            'reason': reason,
+            'rsi': round(rsi, 1),
+            'trend_60m': trend,
+            'dow': dow,
+            'in_kz': self.is_in_kill_zone(),
+            'cooldown_remaining': round(self.cooldown_remaining(), 0),
+        }
+        try:
+            with open(config.SIGNAL_LOG, 'a', newline='') as f:
+                w = csv.DictWriter(f, fieldnames=self._signal_fields())
+                w.writerow(record)
+        except Exception as e:
+            log.warning(f"Failed to write signal log: {e}")
+
+    def write_daily_summary(self):
+        """Write an end-of-day summary to daily_summary.log."""
+        now = self._now()
+        lines = []
+        lines.append(f"\n{'='*60}")
+        lines.append(f"  DAILY SUMMARY — {now.strftime('%Y-%m-%d %A')}")
+        lines.append(f"{'='*60}")
+
+        if not self.trade_log:
+            lines.append("  No trades today.")
+        else:
+            wins = [t for t in self.trade_log if t['result'] == 'WIN']
+            losses = [t for t in self.trade_log if t['result'] == 'LOSS']
+            total_pnl = sum(t['pnl'] for t in self.trade_log)
+            total = len(self.trade_log)
+            wr = len(wins) / total * 100 if total > 0 else 0
+
+            lines.append(f"  Trades:     {total}")
+            lines.append(f"  Wins:       {len(wins)}")
+            lines.append(f"  Losses:     {len(losses)}")
+            lines.append(f"  Win Rate:   {wr:.1f}%")
+            lines.append(f"  Net PnL:    ${total_pnl:+,.2f}")
+            lines.append(f"  Balance:    ${self.virtual_cash:,.2f}")
+            lines.append(f"  Monthly:    ${self._monthly_pnl:+,.2f}")
+            lines.append(f"  Consec L:   {self._consec_losses}")
+            lines.append(f"  Month Halt: {'YES' if self._month_halted else 'No'}")
+            lines.append(f"  {'─'*56}")
+
+            for i, t in enumerate(self.trade_log, 1):
+                hold = ''
+                if 'hold_seconds' in t and t['hold_seconds']:
+                    m, s = divmod(int(t['hold_seconds']), 60)
+                    hold = f" ({m}m{s}s)"
+                be = ' [BE]' if t.get('be_triggered') else ''
+                lines.append(
+                    f"  #{i} {t['signal']:5s} {t['qty']}ct | "
+                    f"In:{t['entry']:.2f} Out:{t['exit']:.2f} | "
+                    f"{t['points']:+.2f}pts ${t['pnl']:+,.2f} {t['result']}"
+                    f"{be}{hold}"
+                )
+
+        lines.append(f"{'='*60}\n")
+        summary = '\n'.join(lines)
+
+        # Write to file
+        try:
+            with open(config.DAILY_SUMMARY, 'a') as f:
+                f.write(summary)
+        except Exception as e:
+            log.warning(f"Failed to write daily summary: {e}")
+
+        # Also log it
+        for line in lines:
+            log.info(line)
 
     def stats_summary(self) -> str:
         if not self.trade_log:
